@@ -4,7 +4,7 @@ import os
 import rospy
 from std_msgs.msg import String
 from duckietown.dtros import DTROS, NodeType
-
+from std_msgs.msg import Float64
 
 class MyPublisherNode(DTROS):
 

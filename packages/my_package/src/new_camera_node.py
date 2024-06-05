@@ -4,9 +4,9 @@ import os
 import rospy
 from duckietown.dtros import DTROS, NodeType
 from sensor_msgs.msg import CompressedImage
-
 import cv2
 from cv_bridge import CvBridge
+from std_msgs.msg import Bool
 
 class CameraReaderNode(DTROS):
 
@@ -23,16 +23,16 @@ class CameraReaderNode(DTROS):
         cv2.namedWindow(self._window, cv2.WINDOW_AUTOSIZE)
         # construct subscriber
         self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self.callback)
+        self._remote = rospy.Publisher('camera_detected', Bool, queue_size = 1)
 
     def callback(self, msg):
         # convert JPEG bytes to CV image
         image = self._bridge.compressed_imgmsg_to_cv2(msg)
-        # display frame
-        cv2.imshow(self._window, image)
-        cv2.waitKey(1)
+        self._remote.publish(image)
+        
 
 if __name__ == '__main__':
     # create the node
-    node = CameraReaderNode(node_name='camera_reader_node')
+    node = CameraReaderNode(node_name='new_camera_node')
     # keep spinning
     rospy.spin()

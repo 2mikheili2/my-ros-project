@@ -40,12 +40,20 @@ class WheelEncoderReaderNode(DTROS):
         # publish received tick messages every 0.05 second (20 Hz)
         rate = rospy.Rate(20)
         while not rospy.is_shutdown():
-            if self._ticks_right is not None and self._ticks_left is not None:
+            # if self._ticks_right is not None and self._ticks_left is not None:
+            #     # start printing values when received from both encoders
+            #     msg = f"Wheel encoder ticks [LEFT, RIGHT]: {self._ticks_left}, {self._ticks_right}"
+            #     rospy.loginfo(msg)
+            self.mess()
+            rate.sleep()
+
+    def mess(self):
+        if self._ticks_right is not None and self._ticks_left is not None:
                 # start printing values when received from both encoders
                 msg = f"Wheel encoder ticks [LEFT, RIGHT]: {self._ticks_left}, {self._ticks_right}"
                 rospy.loginfo(msg)
-            rate.sleep()
 
+    
 if __name__ == '__main__':
     # create the node
     node = WheelEncoderReaderNode(node_name='wheel_encoder_reader_node')
