@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import os
@@ -30,8 +31,28 @@ class LaneFollowerNode(DTROS):
         self.left_pub = rospy.Publisher('lane-follower-left', Float64, queue_size = 1)
         self.right_pub = rospy.Publisher('lane-follower-right', Float64, queue_size = 1)
         self.red_sub = rospy.Subscriber("red-state", Bool, self.update_state)
+        
         self._state = False
-        self._const = 0.05
+
+        self._h = 480
+        self._w = 640
+
+        self._mask_new = mask_new = np.ones((self._h, self._w), dtype = np.uint8)
+        self._mask_new[: self._h // 2, : ] = 0
+        self._mask_left = np.ones(mask_new.shape)
+        self._mask_left[ : ,int(np.floor(self._w / 2)) : ] = 0
+
+        self._mask_right = np.ones(mask_new.shape)
+        self._mask_right[ : , : int(np.floor(self._w / 2 ))] = 0
+
+        self._const = 0.2
+        self._gain = 1
+
+        self.l_max = -math.inf
+        self.r_max = -math.inf
+        self.l_min = math.inf
+        self.r_min = math.inf
+
 
     def run(self):
     # publish 10 messages every second (10 Hz)
@@ -40,6 +61,7 @@ class LaneFollowerNode(DTROS):
             # print(self._state)
             # print(self._state)
             if self._state == False:
+                self.update_vel()
                 self.left_pub.publish(self._left_velocity)
                 self.right_pub.publish(self._right_velocity)
             rate.sleep()
@@ -52,51 +74,43 @@ class LaneFollowerNode(DTROS):
         self._image = self._bridge.compressed_imgmsg_to_cv2(msg)
         # cv2.imshow(self._window, self._image)
         # cv2.waitKey(1)
-        self._left_velocity = 2
-        self._right_velocity = 2
+        # self._left_velocity = 2
+        # self._right_velocity = 2
         # print(self._left_velocity)
-        image_left = self.left_yellow(self._image)
-        image_right = self.right_white(self._image)
-        l = float(np.sum(image_left))
-        r = float(np.sum(image_right))
-        self.change_velocity(l, r)
         # cv2.imshow('left', image_left)
         # cv2.waitKey(1)
         # cv2.imshow('right', image_right)
         # cv2.waitKey(1)
     
+    
+
+    def update_vel(self):
+        image_left = self.left_yellow(self._image)
+        image_right = self.right_white(self._image)
+        l = float(np.sum(image_left) / 255)
+        r = float(np.sum(image_right) / 255)
+        self.change_velocity(l, r)
+
     def change_velocity(self, l, r):
-        # l = min(0.95, max(l, 0.05))
-        # r = min(0.95, max(r, 0.05)) 
-        s = 2 * l + r
-        if s == 0:
-            l = 0.5
-            r = 0.5
-        else :
-            l = (2 * l) / s
-            r = r / s
-        # l = max(l, 0.01)
-        # r = max(r, 0.01)
-        l = l + self._const
-        r = r + self._const
-        # if l == 0.02:
-        #     r = 1.02
-        # if r == 0.02:
-        #     l = 1.02 
-        # print(l, r)
-        self._left_velocity = 2 * l / 4
-        self._right_velocity = 2 * r / 4
+        self.l_max = max(l, self.l_max)
+        self.r_max = max(r, self.r_max)
+        self.l_min = min(l, self.l_min)
+        self.r_min = min(r, self.r_min)
+    
+        ls = self.rescale(l, self.l_min, self.l_max)
+        rs = self.rescale(r, self.r_min, self.r_max)
+
+        self._left_velocity = self._const + self._gain * ls
+        self._right_velocity = self._const + self._gain * rs
+    
+    def rescale(a, L, U):
+        if np.allclose(L, U):
+            return 0.0
+        return (a - L) / (U - L)
 
     # Define the range for the red color in HSV space
 
     def right_white(self, image):
-        mask_new = np.ones((image.shape[0], image.shape[1]), dtype = np.uint8)
-        mask_new[: image.shape[0] // 2, : ] = 0
-        width = image.shape[1]
-        mask_left = np.ones(mask_new.shape)
-        mask_left[:,int(np.floor(width/2)):width + 1] = 0
-        mask_right = np.ones(mask_new.shape)
-        mask_right[:,0:int(np.floor(width/2))] = 0
 
         hls = cv2.cvtColor(image, cv2.COLOR_BGR2HLS_FULL)
         lower_white = np.array([0, 173, 0])         # CHANGE ME
@@ -111,17 +125,10 @@ class LaneFollowerNode(DTROS):
         _, mask_mag = cv2.threshold(sobel_magnitude, threshold_value, 255, cv2.THRESH_BINARY)
         # mask_sobelx_pos = (sobel_x > 0)
         # mask_sobely_neg = (sobel_y < 0)
-        mask_right_edge = np.multiply(mask_new, np.multiply(mask_right, mask_mag)) #  * mask_sobelx_pos * mask_sobely_neg
+        mask_right_edge = np.multiply(self._mask_new, np.multiply(self._mask_right, mask_mag)) #  * mask_sobelx_pos * mask_sobely_neg
         return mask_right_edge
     
     def left_yellow(self, image):
-        mask_new = np.ones((image.shape[0], image.shape[1]), dtype = np.uint8)
-        mask_new[: image.shape[0] // 2, : ] = 0
-        width = image.shape[1]
-        mask_left = np.ones(mask_new.shape)
-        mask_left[:,int(np.floor(width/2)):width + 1] = 0
-        mask_right = np.ones(mask_new.shape)
-        mask_right[:,0:int(np.floor(width/2))] = 0
 
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         lower_yellow = np.array([9, 129, 155])
@@ -135,7 +142,7 @@ class LaneFollowerNode(DTROS):
         _, mask_mag = cv2.threshold(sobel_magnitude, threshold_value, 255, cv2.THRESH_BINARY)
         # mask_sobelx_neg = (sobel_x < 0)
         # mask_sobely_neg = (sobel_y < 0)
-        mask_left_edge = np.multiply(mask_new, np.multiply(mask_left, mask_mag)) # * mask_sobelx_neg * mask_sobely_neg
+        mask_left_edge = np.multiply(self._mask_new, np.multiply(self._mask_left, mask_mag)) # * mask_sobelx_neg * mask_sobely_neg
         return mask_left_edge
     
 

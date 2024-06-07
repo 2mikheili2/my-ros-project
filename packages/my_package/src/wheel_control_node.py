@@ -36,10 +36,14 @@ class WheelControlNode(DTROS):
         self.red_sub = rospy.Subscriber("red-state", Bool, self.update_state)
         self._state = False
 
+        self.left = rospy.Publisher("left-angle", Float64, self.set_left)
+        self.right = rospy.Publisher("right-angle", Float64, self.set_right)
+
     def run(self):
         # publish 10 messages every second (10 Hz)
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
+            # print(123)
             if self._state  == False:
                 self.pub()
             rate.sleep()
@@ -58,6 +62,7 @@ class WheelControlNode(DTROS):
     
     def set_throtle(self, thro):
         if thro.data is not None:
+            # print(thro.data)
             self._left_throtle = thro.data
             self._right_throtle = thro.data 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os
+import os   
 import rospy
 from duckietown.dtros import DTROS, NodeType
 from duckietown_msgs.msg import Twist2DStamped
@@ -26,13 +26,13 @@ class TwistControlNode(DTROS):
         self._publisher = rospy.Publisher(twist_topic, Twist2DStamped, queue_size=1)
         self.twist_sub = rospy.Subscriber("velocity", Float64, self.set_velocity)
         self.red_sub = rospy.Subscriber("red-state", Bool, self.update_state)
-        self._state = False
+        self._state = True
 
     def run(self):
         # publish 10 messages every second (10 Hz)
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
-            # print(self._v)
+            print(123)
             if self._state == True:
                 self.pub()
     
@@ -48,6 +48,7 @@ class TwistControlNode(DTROS):
             self._v = vel.data
 
     def on_shutdown(self):
+        self._v = 0
         stop = Twist2DStamped(v=0.0, omega=0.0)
         self._publisher.publish(stop)
 

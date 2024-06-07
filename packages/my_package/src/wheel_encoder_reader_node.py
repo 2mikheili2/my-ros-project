@@ -44,6 +44,7 @@ class WheelEncoderReaderNode(DTROS):
             #     # start printing values when received from both encoders
             #     msg = f"Wheel encoder ticks [LEFT, RIGHT]: {self._ticks_left}, {self._ticks_right}"
             #     rospy.loginfo(msg)
+            # print("dasd")
             self.mess()
             rate.sleep()
 

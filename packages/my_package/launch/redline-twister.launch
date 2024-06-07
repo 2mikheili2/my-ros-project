@@ -2,6 +2,6 @@
 
     <arg name="pkg_name" value="my_package"/>
     <node  name="redline_detection_node" pkg="$(arg pkg_name)" type="redline_detection_node.py" output="screen"></node>
-    <node  name="twist_control_node" pkg="$(arg pkg_name)" type="twist_control_node.py" output="screen"></node>
+    <node  name="wheel_control_node" pkg="$(arg pkg_name)" type="wheel_control_node.py" output="screen"></node>
    
 </launch>
