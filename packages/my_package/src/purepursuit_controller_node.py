@@ -1,214 +1,266 @@
 #!/usr/bin/env python3
-import rospy
-import numpy as np
-from duckietown_msgs.msg import Twist2DStamped, LanePose, SegmentList, Segment
-from geometry_msgs.msg import Point
-
-from std_msgs.msg import String
-from sensor_msgs.msg import CompressedImage, Image
-from duckietown_utils.jpg import bgr_from_jpg
-import cv2
-import cv2 as cv
+import threading
 import time
-from cv_bridge import CvBridge, CvBridgeError
-
-import duckietown_utils as dtu
-from duckietown_utils import (logger, get_duckiefleet_root)
-from duckietown_utils.yaml_wrap import (yaml_load_file, yaml_write_to_file)
-
 import os
-stop = False
+import rospy
+from duckietown.dtros import DTROS, NodeType
+from sensor_msgs.msg import CompressedImage
+from duckietown_msgs.msg import WheelsCmdStamped
+import numpy as np
+import cv2
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from std_msgs.msg import Float64, Bool
+from rospy.numpy_msg import numpy_msg
 
-def load_homography():
-        '''Load homography (extrinsic parameters)'''
-        filename = (get_duckiefleet_root() + "/calibrations/camera_extrinsic/" + robot_name + ".yaml")
-        if not os.path.isfile(filename):
-            logger.warn("no extrinsic calibration parameters for {}, trying default".format(robot_name))
-            filename = (get_duckiefleet_root() + "/calibrations/camera_extrinsic/default.yaml")
-            if not os.path.isfile(filename):
-                logger.error("can't find default either, something's wrong")
-            else:
-                data = yaml_load_file(filename)
-        else:
-            rospy.loginfo("Using extrinsic calibration of " + robot_name)
-            data = yaml_load_file(filename)
-        logger.info("Loaded homography for {}".format(os.path.basename(filename)))
-        return np.array(data['homography']).reshape((3,3))
 
-def point2ground(x_arr, y_arr, norm_x, norm_y):
-        new_x_arr, new_y_arr = [], []
-        H = load_homography()
-        for i in range(len(x_arr)):
-            u = x_arr[i] * 480/norm_x
-            v = y_arr[i] * 640/norm_y
-            uv_raw = np.array([u, v])
-            uv_raw = np.append(uv_raw, np.array([1]))
-            ground_point = np.dot(H, uv_raw)
-            point = Point()
-            x = ground_point[0]
-            y = ground_point[1]
-            z = ground_point[2]
-            point.x = x/z
-            point.y = y/z
-            point.z = 0.0
-            new_x_arr.append(point.x)
-            new_y_arr.append(point.y)
-        return new_x_arr, new_y_arr
+def nothing(x):
+    pass
 
-def filtered_seglist_cb(seglist_msg):
+
+class LaneFollowerNode(DTROS):
+
+    def __init__(self, node_name):
+        # initialize the DTROS parent class
+        super(LaneFollowerNode, self).__init__(
+            node_name=node_name, node_type=NodeType.VISUALIZATION)
+        # static parameters
+        self._vehicle_name = os.environ['VEHICLE_NAME']
+        self._camera_topic = f"/{self._vehicle_name}/camera_node/image/compressed"
+        # bridge between OpenCV and ROS
+        wheels_topic = f"/{self._vehicle_name}/wheels_driver_node/wheels_cmd"
+        self._window = "camera-reader"
+        self.bridge = CvBridge()
+        cv2.namedWindow(self._window, cv2.WINDOW_AUTOSIZE)
+
+        # construct subscriber
+        self.sub2 = rospy.Subscriber(
+            self._camera_topic, CompressedImage, self.redline)
+        self.sub = rospy.Subscriber(
+            self._camera_topic, CompressedImage, self.callback)
+        self._publisher = rospy.Publisher(
+            wheels_topic, WheelsCmdStamped, queue_size=1)
+
+        self.left_motor = rospy.Publisher("lane-follower-left", Float64, queue_size=1)
+        self.right_motor = rospy.Publisher(
+            "lane-follower-right", Float64, queue_size=1)
+
+        self.left = 0.2
+        self.right = 0.2
+        self.gain = 0.2
+        self.const = 0.25
+
+        self._ref_vel = 1
+
+        self.shutting_down = False
+        rospy.on_shutdown(self.shutdown_hook)
+
+        self.red_line_detected = False
+        self.has_stopped = False
+        self.red_image = None
+
+        self._state = True
+        self._timer = None
+        self._Kp = 1
+        self._Ki = 0.01
+        self._Kd = 0.0
+        self._integral = 0
+        self._derivative = 0
+        self._vel = 1
+        self._error = None
+
+        def stop_and_turn():
+            # Stop for 1 second
+            self.left_motor.publish(0)
+            self.right_motor.publish(0)
+            rospy.sleep(1)
+
+            # Move straight for 5 seconds
+            self.left_motor.publish(0.5)
+            self.right_motor.publish(0.5)
+            rospy.sleep(5)
+
+            # Turn right
+            self.left_motor.publish(0.5)
+            self.right_motor.publish(0)
+            rospy.sleep(0.2)
+
+            # Reset to normal operation
+            self.red_line_detected = False
+
+        thread = threading.Thread(target=stop_and_turn)
+        thread.start()
+
+    def shutdown_hook(self):
+        self.shutting_down = True
+        self.left_motor.publish(0)
+        self.right_motor.publish(0)
+        cv2.destroyAllWindows()  # Close the OpenCV window
+
+    def PID(self):
+        t = rospy.get_time()
+        d_t = 0.1
+        if self._timer is not None:
+            d_t = t - self._timer
+        if d_t < 0.01:
+            d_t = 0.01
         
-    #initialize variables
-    yellow_offset, white_offset, omega_gain = -0.12, 0.15, 2
-    white_seg_count, yellow_seg_count = 0, 0
-    white_x_accumulator, white_y_accumulator, yellow_x_accumulator, yellow_y_accumulator = 0.0, 0.0, 0.0, 0.0
-    white_centroid_x, white_centroid_y, yellow_centroid_x, yellow_centroid_y = 0.0, 0.0, 0.0, 0.0
+        # print(d_t)
+        self._timer = t
+        error = self._ref_vel - self._vel
 
-    for segment in seglist_msg.segments:
-        #the point is behind us
-        if segment.points[0].x < 0 or segment.points[1].x < 0: 
-            continue
-
-        #calculate white segments sum, count values
-        if segment.color == segment.WHITE:
-            white_x_accumulator += (segment.points[0].x + segment.points[1].x) / 2
-            white_y_accumulator += (segment.points[0].y + segment.points[1].y) / 2 
-            white_seg_count += 1.0
-        #calculate yellow segments sum, count values
-        elif segment.color == segment.YELLOW:
-            yellow_x_accumulator += (segment.points[0].x + segment.points[1].x) / 2
-            yellow_y_accumulator += (segment.points[0].y + segment.points[1].y) / 2 
-            yellow_seg_count += 1.0
-        #skip red segments
+        self._integral += error * d_t
+        if self._error is None:
+            self._derivative = 0
         else:
-            continue
+            self._derivative = (error - self._error) / d_t
+        self._error = error
 
-    #calculate centroid for white segments
-    if white_seg_count > 0:
-        white_centroid_x, white_centroid_y = white_x_accumulator/white_seg_count, white_y_accumulator/white_seg_count
+        self._vel += self._Kp * self._error + self._Ki * self._integral + self._Kd * self._derivative 
 
-    #calculate centroid for yellow segments
-    if yellow_seg_count > 0:
-        yellow_centroid_x, yellow_centroid_y = yellow_x_accumulator/yellow_seg_count, yellow_y_accumulator/yellow_seg_count
 
-    #if white seg count is greater, trust white line segments
-    if  white_seg_count >  yellow_seg_count:   
-        follow_point_x = white_centroid_x
-        follow_point_y = white_centroid_y + white_offset
+    def redline(self, msg):
+        # self.PID()
+        self.has_stopped = not self.has_stopped
+        image = self.bridge.compressed_imgmsg_to_cv2(msg)
+        # image = cv2.bilateralFilter(image, 12, 125, 155)
+        yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
+        lb_red = np.array([0, 0, 170])
+        ub_red = np.array([2172, 5204, 10000])
+        mask_red = cv2.inRange(yuv, lb_red, ub_red)
+        red_image = cv2.bitwise_and(image, image, mask=mask_red)
+        red_image[:300, :] = 0
 
-    #if yellow seg count is greater, trust yellow line segments
-    elif  yellow_seg_count > white_seg_count:  
-        follow_point_x = yellow_centroid_x
-        follow_point_y = yellow_centroid_y + yellow_offset
-    
-    #if both are equal, take average
-    else:
-        follow_point_x = 0.5 * (white_centroid_x + yellow_centroid_x)
-        follow_point_y = 0.5 * (white_centroid_y + yellow_centroid_y)
-        #check if they are zero, because they might become zero if no white/yellow segments are encountered
-        if follow_point_x == 0 and follow_point_y == 0:
-            follow_point_x, follow_point_y = 0.1, 0
+        gray = cv2.cvtColor(red_image, cv2.COLOR_BGR2GRAY)
 
-    #tan_alpha = y/x => alpha = tan-1(y/x)
-    alpha = np.arctan2(follow_point_y, follow_point_x)
-    lookahead_dist = np.sqrt(follow_point_x * follow_point_x + follow_point_y * follow_point_y)
-    #calculating v, omega
+        # Find contours in the image
+        contours, _ = cv2.findContours(
+            gray, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        area = 0
+        # Filter horizontal blocks and print "found" when detected
+        x, y, w, h, aspect_ratio = 0, 0, 0, 0, 0
+        for cnt in contours:
+            max_contour = max(contours, key=cv2.contourArea)
 
-    
-    if np.abs(follow_point_y) > 0.2:
-        v, omega_gain = 0.25, 3
-    else:
-        if np.abs(follow_point_x) >= 0.55:
-            v, omega_gain = 0.7, 1.5
-        elif np.abs(follow_point_x) > 0.48 and np.abs(follow_point_x) < 0.55:
-            v, omega_gain = 0.4, 1.5
+            # Get bounding box and calculate aspect ratio
+            x, y, w, h = cv2.boundingRect(max_contour)
+
+            aspect_ratio = float(w)/h  # width/height
+
+            area = max(area, w*h)
+            # if aspect_ratio >= 2:  # Adjust this value to allow some deviation
+                # print("Found")
+                # cv2.rectangle(red_image, (x, y), (x+w, y+h), (255, 0, 0), 2)
+        self.red_image = red_image
+        # print("callback2")
+        red_lower_edge = y + h
+
+        if aspect_ratio > 2:
+            self._ref_vel = 1 - red_lower_edge / \
+                480 if self._ref_vel >= 0.02 else self._ref_vel
         else:
-            v, omega_gain = 0.25, 2
+            self._ref_vel = 1
+        if area > 40000 and not self.has_stopped and not self.red_line_detected:
+            self.has_stopped = True
+            self.left_motor.publish(0)
+            self.right_motor.publish(0)
+            rospy.sleep(1)
+            self.left_motor.publish(0.4)
+            self.right_motor.publish(0.1)
+            rospy.sleep(2.3)
+            self.has_stopped = False
+            self.red_line_detected = True
+        print(abs(self._ref_vel - self._vel))
 
-    omega  =  2 * v * np.sin(alpha) / lookahead_dist        
-
-    #publishing to car_cmd topic
-    car_control_msg = Twist2DStamped()
-    if stop is True:
-        car_control_msg.v = 0
-        car_control_msg.omega = 0
-        print("Sending V= 0, omega = 0")
-    else:
-        car_control_msg.v = v
-        car_control_msg.omega = omega * omega_gain
-        print('sending: v, omega', v, omega)
-    pub_car_cmd.publish(car_control_msg)
-
-def processImage(image_msg):
-    global stop
-    image_size = [120,160]
-    # top_cutoff = 40
-
-    start_time = time.time()
-    try:
-        image_cv = bgr_from_jpg(image_msg.data)
-    except ValueError as e:
-        print("image decode error", e)
-        return
+    def callback(self, msg):    
     
-    # Resize and crop image
-    hei_original, wid_original = image_cv.shape[0:2]
+        if self.shutting_down or self.has_stopped:
+            return
 
-    if image_size[0] != hei_original or image_size[1] != wid_original:
-        image_cv = cv2.resize(image_cv, (image_size[1], image_size[0]),
-                                interpolation=cv2.INTER_NEAREST)
+        self.image = self.bridge.compressed_imgmsg_to_cv2(msg)
+        # GOOD VALUES
+        # self.image = cv2.bilateralFilter(self.image, 12, 125, 155)
 
-    hsv = cv.cvtColor(image_cv, cv.COLOR_BGR2HSV)
-    hsv_obs_red1 = np.array([0,140, 100])
-    hsv_obs_red2 = np.array([15,255,255])
-    hsv_obs_red3 = np.array([165,140, 100]) 
-    hsv_obs_red4 = np.array([180,255,255])
+        # display updated frame with correcgt hsv values
 
-    bw1 = cv.inRange(hsv, hsv_obs_red1, hsv_obs_red2)
-    bw2 = cv.inRange(hsv, hsv_obs_red3, hsv_obs_red4)
-    bw = cv.bitwise_or(bw1, bw2)
-    cnts = cv2.findContours(bw.copy(),
-                              cv2.RETR_EXTERNAL,
-                              cv2.CHAIN_APPROX_SIMPLE)[-2]
+        luv = cv2.cvtColor(self.image, cv2.COLOR_BGR2LUV)
+        yuv = cv2.cvtColor(self.image, cv2.COLOR_BGR2YUV)
+        hls = cv2.cvtColor(self.image, cv2.COLOR_BGR2HLS)
 
-    if len(cnts)>1:
-        print('object detected')
-        red_area = max(cnts, key=cv2.contourArea)
-        (xg,yg,wg,hg) = cv2.boundingRect(red_area)
-        box_img = cv2.rectangle(image_cv,(xg,yg),(xg+wg, yg+hg),(0,255,0),2)
-        print('BEFORE X', [xg, xg+wg], " BEFORE Y", [yg+hg, yg+hg])
-        x_arr, y_arr = point2ground([xg, xg+wg], [yg + hg, yg + hg], image_size[0], image_size[1])
-        print("BOTTOM OF ROBOT : X ", x_arr, ' Y :', y_arr)
-        if x_arr[0] < 0.35:
-            print("STOP THE Bot")
-            stop = True
-        else:
-            stop = False
-        image_msg_out = bridge.cv2_to_imgmsg(box_img, "bgr8")
-        image_msg_out.header.stamp = image_msg.header.stamp
-        pub_image.publish(image_msg_out)
-    else:
-        stop = False
-        image_msg_out = bridge.cv2_to_imgmsg(image_cv, "bgr8")
-        image_msg_out.header.stamp = image_msg.header.stamp
-        pub_image.publish(image_msg_out)
-    
-    print('Time to process', time.time() - start_time)
+        lb_yellow = np.array([0, 0, 170])
+        ub_yellow = np.array([2172, 5204, 10000])
+        mask_yellow = cv2.inRange(luv, lb_yellow, ub_yellow)
+        yellow_image = cv2.bitwise_and(
+            self.image, self.image, mask=mask_yellow)
+        yellow_image[:240, :] = 0
+        kernel = np.ones((7, 7), np.uint8)
+        yellow_image = cv2.dilate(yellow_image, kernel, iterations=2)
 
-if __name__ == "__main__":
-    #defining node, publisher, subscriber
-    rospy.init_node("purepursuit_controller_node", anonymous=True)
-    pub_car_cmd = rospy.Publisher("~car_cmd", Twist2DStamped, queue_size=10)
-    pub_image = rospy.Publisher("~image_with_object", Image, queue_size=1)
+        # sobel_x = cv2.Sobel(mask_white, cv2.CV_64F, 1, 0, ksize=3)
+        # sobel_y = cv2.Sobel(mask_white, cv2.CV_64F, 0, 1, ksize=3)
+        # sobel_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+        # sobel_magnitude = np.uint8(255 * sobel_magnitude / np.max(sobel_magnitude))
 
-    bridge = CvBridge()
-    stop = False
-    robot_name = rospy.get_param("~config_file_name", None)
-    if robot_name is None:
-        robot_name = dtu.get_current_robot_name()
+        lb_white = np.array([0, 173, 0])
+        ub_white = np.array([179, 255, 255])
+        mask_white = cv2.inRange(hls, lb_white, ub_white)
+        white_image = cv2.bitwise_and(self.image, self.image, mask=mask_white)
+        white_image[:200, :] = 0
+        white_image[:, :200] = 0
 
-    rospy.Subscriber("~corrected_image/compressed", CompressedImage, processImage, queue_size=1)
-    sub_filtered_seglist = rospy.Subscriber("~seglist_filtered", SegmentList, filtered_seglist_cb)
+        # NORMAL VALUES
 
+        lb_red = np.array([0, 0, 170])
+        ub_red = np.array([2172, 5204, 10000])
+        mask_red = cv2.inRange(yuv, lb_red, ub_red)
+        red_image = cv2.bitwise_and(self.image, self.image, mask=mask_red)
+        red_image[:300, :] = 0
+
+        tmp = cv2.bitwise_or(yellow_image, self.red_image)
+        combined_img = cv2.bitwise_or(tmp, white_image)
+
+        white_color_count = np.count_nonzero(white_image)
+        yellow_color_count = np.count_nonzero(yellow_image)
+
+        white_color_count = white_color_count / (640*480)
+        yellow_color_count = yellow_color_count / (640*480)
+
+        left_motor = (self.const + self.gain * (self.left *
+                      white_color_count)) * self._ref_vel
+        right_motor = (self.const + self.gain * (self.right *
+                       yellow_color_count)) * self._ref_vel
+
+        if white_color_count < 0.1 and yellow_color_count < 0.1:
+            self.left_motor.publish(-0.8)
+            self.right_motor.publish(-0.8)
+        elif abs(white_color_count - yellow_color_count) < 0.05:
+            self.left_motor.publish(0.3)
+            self.right_motor.publish(0.3)
+        if white_color_count >= yellow_color_count:
+            left_motor = left_motor - 0.2 if left_motor > 0.2 else left_motor
+            right_motor += 0.25
+            if not self.shutting_down:
+                self.left_motor.publish(left_motor)
+                self.right_motor.publish(right_motor)
+
+        elif yellow_color_count > white_color_count:
+            right_motor = right_motor - 0.2 if right_motor > 0.2 else right_motor
+            left_motor += 0.25
+            if not self.shutting_down:
+                self.left_motor.publish(left_motor)
+                self.right_motor.publish(right_motor)
+
+        combined_img[:, ::20] = [0, 0, 255]
+        combined_img[::20, :] = [0, 0, 255]
+        combined_img[:, 320] = [255, 0, 0]
+        combined_img[240, :] = [255, 0, 0]
+
+        # cv2.imshow(self._window, combined_img)
+        # cv2.waitKey(1)
+
+
+if __name__ == '__main__':
+    # create the node
+    node = LaneFollowerNode(node_name='lane_follower_node')
+    # keep spinning
     rospy.spin()
-
-    
